@@ -1,8 +1,9 @@
 from celery import Celery
 from typing import Optional
 import requests
-from openai import OpenAI
 import redis
+from crewai.agent import Agent
+
 
 celery_app = Celery(
     "tasks",
@@ -10,53 +11,72 @@ celery_app = Celery(
     backend="redis://localhost:6379/0",
 )
 
-# GitHub API Token (Optional)
+# GitHub API base URL
 GITHUB_API_URL = "https://api.github.com"
 
 # Initialize Redis client
-redis_client = redis.StrictRedis(host='localhost', port=6379, db=0)
-
+redis_client = redis.StrictRedis(host="localhost", port=6379, db=0)
 
 @celery_app.task(bind=True)
 def analyze_pr_task(self, repo_url: str, pr_number: int, github_token: Optional[str]):
     task_id = self.request.id
-    # Step 1: Fetch PR details using GitHub API
-    headers = {"Authorization": f"token {github_token}"} if github_token else {}
-    pr_url = f"{GITHUB_API_URL}/repos/{repo_url}/pulls/{pr_number}"
-    response = requests.get(pr_url, headers=headers)
+    redis_client.set(task_id, "processing")
 
-    if response.status_code != 200:
-        redis_client.set(task_id, f"Failed to fetch PR data: {response.text}")
-        return
+    try:
+        # Step 1: Fetch PR details from GitHub API
+        headers = {"Authorization": f"token {github_token}"} if github_token else {}
+        pr_url = f"{GITHUB_API_URL}/repos/{repo_url}/pulls/{pr_number}"
+        response = requests.get(pr_url, headers=headers)
 
-    pr_data = response.json()
+        if response.status_code != 200:
+            redis_client.set(task_id, f"failed: {response.text}")
+            return
 
-    # Step 2: Extract the changes (files changed, diff, etc.)
-    pr_files_url = pr_data['url'] + '/files'
-    pr_files_response = requests.get(pr_files_url, headers=headers)
-    if pr_files_response.status_code != 200:
-        redis_client.set(task_id, f"Failed to fetch PR files: {pr_files_response.text}")
-        return
+        pr_data = response.json()
 
-    pr_files = pr_files_response.json()
-    code_changes = [file['patch'] for file in pr_files]
+        # Step 2: Fetch files in the pull request
+        pr_files_url = pr_data["url"] + "/files"
+        pr_files_response = requests.get(pr_files_url, headers=headers)
+        if pr_files_response.status_code != 200:
+            redis_client.set(task_id, f"failed: {pr_files_response.text}")
+            return
 
-    openai_client = OpenAI()
+        pr_files = pr_files_response.json()
 
-    # Step 3: Send code to OpenAI for analysis (simulate code review)
-    analysis_result = openai_client.chat.completions.create(
-        model="gpt-4o",  # You can choose the appropriate model
-        messages = [{ "role": "system", 
-        "content": "You are an expert in coding. You will be provided with the code and your task will be to review the code and suggest improvements" },
-        {
-            "role": "user",
-            "content": "Please review the following code and suggest improvements:\n" + "\n".join(code_changes),
-        },
-    ],
-    )
+        # Step 3: Analyze files using AI agent
+        analysis_results = {"files": [], "summary": {"total_files": 0, "total_issues": 0, "critical_issues": 0}}
 
-    redis_client.set(f"{task_id}_result", analysis_result.choices[0].message.content)
+        for file in pr_files:
+            if "patch" in file:
+                # Analyze the file patch using the AI agent
+                analysis = Agent.analyze_pull_request(file["patch"])
+                if not analysis:
+                    redis_client.set(task_id, f"failed: Could not analyze file {file['filename']}")
+                    continue
 
-    # Update the status in Redis
-    redis_client.set(task_id, "Analysis completed.")
-       
+                issues = []
+                for issue in analysis.get("issues", []):
+                    issues.append({
+                        "type": issue.get("type"),  # Type of the issue: style, bug, etc.
+                        "line": issue.get("line"),  # Line number where the issue occurred
+                        "description": issue.get("description"),  # Issue description
+                        "suggestion": issue.get("suggestion")  # Suggestion to fix the issue
+                    })
+
+                # Append analysis results for the current file
+                analysis_results["files"].append({
+                    "name": file["filename"],
+                    "issues": issues
+                })
+                analysis_results["summary"]["total_files"] += 1
+                analysis_results["summary"]["total_issues"] += len(analysis.get("issues", []))
+                analysis_results["summary"]["critical_issues"] += sum(1 for issue in analysis.get("issues", []) if issue.get("type") == "critical")
+
+        # Step 4: Store results in Redis
+        result_object = {"task_id": task_id, "status": "completed", "results": analysis_results}
+        redis_client.set(f"{task_id}_result", json.dumps(result_object))
+        redis_client.set(task_id, "completed")
+    
+    except Exception as e:
+        redis_client.set(task_id, f"failed: {str(e)}")
+        raise
