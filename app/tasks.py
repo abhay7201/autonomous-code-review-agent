@@ -1,3 +1,4 @@
+import json
 import os
 from celery import Celery
 from typing import Optional
@@ -62,6 +63,9 @@ def analyze_pr_task(self, repo_url: str, pr_number: int, github_token: Optional[
                 - line: line number
                 - description: issue description
                 - suggestion: improvement suggestion
+                
+                Note: 
+                The response you provide will be parsed directly using json.loads() without any modification. Therefore, ensure the output consists solely of a valid JSON object or array, without any surrounding elements like comments, extra text, or special formatting. The goal is to have clean, parsable JSON that can be directly converted into a Python dictionary or list without any errors or additional processing.
 
                 Code:
                 {file["patch"]}
@@ -75,14 +79,20 @@ def analyze_pr_task(self, repo_url: str, pr_number: int, github_token: Optional[
                 },
             ],
             )
+            issues = analysis.choices[0].message.content
+            issues=issues.strip().removeprefix("```json").removesuffix("```")
+            print(issues)
+            issues = json.loads(issues)
+
 
             analysis_results["files"].append({
                     "name": file["filename"],
-                    "issues": analysis.get("issues", [])
+                    "issues": issues
                 })
+            
             analysis_results["summary"]["total_files"] += 1
-            analysis_results["summary"]["total_issues"] += len(analysis.get("issues", []))
-            analysis_results["summary"]["critical_issues"] += sum(1 for issue in analysis.get("issues", []) if issue.get("type") == "critical")
+            analysis_results["summary"]["total_issues"] += len(issues)
+            analysis_results["summary"]["critical_issues"] += sum(1 for issue in issues if issue.get("type") == "critical")
 
     redis_client.set(f"{task_id}_result", str({"task_id": task_id, "status": "completed", "results": analysis_results}))
 
