@@ -1,3 +1,4 @@
+import os
 from celery import Celery
 from typing import Optional
 import requests
@@ -39,23 +40,51 @@ def analyze_pr_task(self, repo_url: str, pr_number: int, github_token: Optional[
         return
 
     pr_files = pr_files_response.json()
-    code_changes = [file['patch'] for file in pr_files]
+   # code_changes = [file['patch'] for file in pr_files]
 
     openai_client = OpenAI()
-
     # Step 3: Send code to OpenAI for analysis (simulate code review)
-    analysis_result = openai_client.chat.completions.create(
-        model="gpt-4o",  # You can choose the appropriate model
-        messages = [{ "role": "system", 
-        "content": "You are an expert in coding. You will be provided with the code and your task will be to review the code and suggest improvements" },
-        {
-            "role": "user",
-            "content": "Please review the following code and suggest improvements:\n" + "\n".join(code_changes),
-        },
-    ],
-    )
 
-    redis_client.set(f"{task_id}_result", analysis_result.choices[0].message.content)
+    analysis_results = {"files": [], "summary": {"total_files": 0, "total_issues": 0, "critical_issues": 0}}
+
+    for file in pr_files:
+        if "patch" in file:
+
+            prompt = f"""
+                Analyze the following code and identify:
+                - Style issues
+                - Bugs or errors
+                - Performance improvements
+                - Best practices
+
+                Return the results as a JSON array of objects with:
+                - type: issue type (e.g., 'style', 'bug', 'performance', 'best_practice')
+                - line: line number
+                - description: issue description
+                - suggestion: improvement suggestion
+
+                Code:
+                {file["patch"]}
+                """
+            analysis = openai_client.chat.completions.create(
+                model="gpt-4o",  
+                messages = [
+                {
+                    "role": "user",
+                    "content": prompt
+                },
+            ],
+            )
+
+            analysis_results["files"].append({
+                    "name": file["filename"],
+                    "issues": analysis.get("issues", [])
+                })
+            analysis_results["summary"]["total_files"] += 1
+            analysis_results["summary"]["total_issues"] += len(analysis.get("issues", []))
+            analysis_results["summary"]["critical_issues"] += sum(1 for issue in analysis.get("issues", []) if issue.get("type") == "critical")
+
+    redis_client.set(f"{task_id}_result", str({"task_id": task_id, "status": "completed", "results": analysis_results}))
 
     # Update the status in Redis
     redis_client.set(task_id, "Analysis completed.")
